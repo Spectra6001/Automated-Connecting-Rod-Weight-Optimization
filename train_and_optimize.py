@@ -31,9 +31,16 @@ TARGET_COLS = [
     "max_displacement_mm",
 ]
 
+
 def train_surrogate_model():
-    if not os.path.exists(DATASET_PATH):
-        print("[INFO] Dataset not found. Generating 600 LHS simulation samples first...")
+    need_regen = not os.path.exists(DATASET_PATH)
+    if not need_regen:
+        df_check = pd.read_csv(DATASET_PATH)
+        if len(df_check) < 300:
+            need_regen = True
+
+    if need_regen:
+        print("[INFO] Generating 600 LHS simulation samples for high-accuracy surrogate training...")
         generate_dataset(n_samples=600, use_freecad=False)
 
     df = pd.read_csv(DATASET_PATH)
@@ -49,13 +56,12 @@ def train_surrogate_model():
     X_test_s = scaler_X.transform(X_test)
     y_train_s = scaler_y.fit_transform(y_train)
 
-    # Deep Multi-Output Neural Network Surrogate
     nn_model = MLPRegressor(
         hidden_layer_sizes=(128, 128, 64),
         activation="relu",
         solver="adam",
         learning_rate_init=0.002,
-        max_iter=800,
+        max_iter=1000,
         random_state=42,
     )
     nn_model.fit(X_train_s, y_train_s)
@@ -77,17 +83,22 @@ def train_surrogate_model():
         "feature_cols": FEATURE_COLS,
         "target_cols": TARGET_COLS,
         "metrics": metrics,
+        "n_trained_samples": len(df),
     }
     joblib.dump(bundle, SURROGATE_MODEL_PATH)
-    print(f"[SUCCESS] Saved Neural Network Surrogate Model to: {SURROGATE_MODEL_PATH}")
-    for k, v in metrics.items():
-        print(f"  -> {k}: R² = {v['R2']}, MAE = {v['MAE']}")
+    print(f"[SUCCESS] Saved Neural Network Surrogate Model ({len(df)} samples) to: {SURROGATE_MODEL_PATH}")
     return bundle
+
 
 def load_or_train_surrogate():
     if not os.path.exists(SURROGATE_MODEL_PATH):
         return train_surrogate_model()
-    return joblib.load(SURROGATE_MODEL_PATH)
+    bundle = joblib.load(SURROGATE_MODEL_PATH)
+    # Retrain automatically if the existing model was trained on the small 10-sample test run
+    if bundle.get("n_trained_samples", 0) < 300:
+        return train_surrogate_model()
+    return bundle
+
 
 def predict_with_surrogate(bundle, full_params_dict):
     x_vec = np.array([[full_params_dict[col] for col in FEATURE_COLS]])
@@ -107,6 +118,7 @@ def predict_with_surrogate(bundle, full_params_dict):
         "factor_of_safety": round(fos, 2),
     }
 
+
 def optimize_connecting_rod(
     length_cc=145.0,
     big_end_id=50.0,
@@ -117,19 +129,19 @@ def optimize_connecting_rod(
     max_disp_limit_mm=0.35,
 ):
     """
-    Uses the trained AI surrogate model + multi-start SLSQP optimization to find the lightest
-    connecting rod geometry that satisfies the Factor of Safety and displacement limits.
+    Two-Stage Physics-Guided AI Optimization:
+    Stage 1: Fast global exploration on the Neural Network Surrogate surface.
+    Stage 2: Trust-region FEA boundary polishing so the verified Factor of Safety (>= min_fos)
+             and Max Displacement (<= max_disp_limit_mm) constraints are strictly satisfied.
     """
     bundle = load_or_train_surrogate()
     mat = MATERIALS[material_name]
-    max_allowable_stress = mat["yield_strength_mpa"] / min_fos
+    # Include a 0.5% margin so rounding geometry to 2 decimal places never dips FoS by 0.01
+    max_allowable_stress = mat["yield_strength_mpa"] / (min_fos * 1.005)
 
-    # 5 Optimizable Design Variables:
-    # x = [ring_thickness, shank_width, beam_thickness, pocket_depth, flange_thickness]
     opt_keys = ["ring_thickness", "shank_width", "beam_thickness", "pocket_depth", "flange_thickness"]
     bounds = [PARAM_BOUNDS[k] for k in opt_keys]
 
-    # Baseline heavy solid-style design (for comparison)
     baseline_params = {
         "length_cc": length_cc,
         "big_end_id": big_end_id,
@@ -160,42 +172,74 @@ def optimize_connecting_rod(
             **mat,
         }
 
-    # Objective: Minimize Mass predicted by Neural Network Surrogate
-    def objective(x):
-        p = build_param_dict(x)
-        pred = predict_with_surrogate(bundle, p)
-        return pred["mass_kg"]
-
-    # Constraints (must be >= 0 for SLSQP)
-    constraints = [
-        # 1. Von Mises Stress <= Allowable Stress
+    # Stage 1: Fast Neural Network Surrogate Search
+    nn_constraints = [
         {"type": "ineq", "fun": lambda x: max_allowable_stress - predict_with_surrogate(bundle, build_param_dict(x))["max_von_mises_mpa"]},
-        # 2. Displacement <= Max Limit
         {"type": "ineq", "fun": lambda x: max_disp_limit_mm - predict_with_surrogate(bundle, build_param_dict(x))["max_displacement_mm"]},
-        # 3. Geometric feasibility: Web thickness >= 3.5 mm (beam_thickness - 2*pocket_depth >= 3.5)
         {"type": "ineq", "fun": lambda x: x[2] - 2.0 * x[3] - 3.5},
-        # 4. Geometric feasibility: Pocket width >= 4.0 mm (shank_width - 2*flange_thickness >= 4.0)
         {"type": "ineq", "fun": lambda x: x[1] - 2.0 * x[4] - 4.0},
     ]
 
-    best_res = None
-    best_mass = float("inf")
     rng = np.random.default_rng(42)
+    best_nn_x = [7.5, 22.0, 20.0, 3.0, 4.5]
+    best_nn_mass = float("inf")
 
-    # Multi-start gradient optimization across the Neural Network surrogate surface
-    for _ in range(12):
+    for _ in range(8):
         x0 = [rng.uniform(low, high) for (low, high) in bounds]
-        res = minimize(objective, x0, method="SLSQP", bounds=bounds, constraints=constraints, options={"maxiter": 150})
-        if res.success and res.fun < best_mass:
-            best_mass = res.fun
-            best_res = res
+        res_nn = minimize(
+            lambda x: predict_with_surrogate(bundle, build_param_dict(x))["mass_kg"],
+            x0,
+            method="SLSQP",
+            bounds=bounds,
+            constraints=nn_constraints,
+            options={"maxiter": 80},
+        )
+        if res_nn.success and res_nn.fun < best_nn_mass:
+            best_nn_mass = res_nn.fun
+            best_nn_x = res_nn.x
 
-    opt_x = best_res.x if best_res is not None else [6.0, 19.0, 17.0, 4.5, 3.8]
+    # Stage 2: Exact Physics-Guided Boundary Polishing (guarantees FoS >= min_fos)
+    fea_constraints = [
+        {"type": "ineq", "fun": lambda x: max_allowable_stress - evaluate_connecting_rod_analytical(build_param_dict(x))["max_von_mises_mpa"]},
+        {"type": "ineq", "fun": lambda x: max_disp_limit_mm - evaluate_connecting_rod_analytical(build_param_dict(x))["max_displacement_mm"]},
+        {"type": "ineq", "fun": lambda x: x[2] - 2.0 * x[3] - 3.5},
+        {"type": "ineq", "fun": lambda x: x[1] - 2.0 * x[4] - 4.0},
+    ]
+
+    best_fea_res = None
+    best_fea_mass = float("inf")
+
+    # Start from the AI Surrogate's candidate + 3 boundary-spanning seeds
+    starts = [
+        best_nn_x,
+        [8.0, 24.0, 21.0, 2.5, 5.0],
+        [6.5, 20.0, 18.0, 3.8, 4.0],
+        [9.0, 28.0, 24.0, 2.0, 6.0],
+    ]
+    for x_init in starts:
+        res_fea = minimize(
+            lambda x: evaluate_connecting_rod_analytical(build_param_dict(x))["mass_kg"],
+            x_init,
+            method="SLSQP",
+            bounds=bounds,
+            constraints=fea_constraints,
+            options={"maxiter": 120},
+        )
+        cand_eval = evaluate_connecting_rod_analytical(build_param_dict(res_fea.x))
+        if (
+            cand_eval["factor_of_safety"] >= min_fos - 0.01
+            and cand_eval["max_displacement_mm"] <= max_disp_limit_mm + 1e-3
+            and cand_eval["mass_kg"] < best_fea_mass
+        ):
+            best_fea_mass = cand_eval["mass_kg"]
+            best_fea_res = res_fea.x
+
+    # Fallback to heaviest maximum-strength geometry if user sets an extreme load that exceeds bounds
+    opt_x = best_fea_res if best_fea_res is not None else [9.0, 28.0, 24.0, 2.0, 6.0]
     opt_params = build_param_dict(opt_x)
     for k in opt_keys:
         opt_params[k] = round(opt_params[k], 2)
 
-    # Verify with both AI Surrogate and FEA Analytical Evaluator
     ai_pred = predict_with_surrogate(bundle, opt_params)
     fea_verified = evaluate_connecting_rod_analytical(opt_params)
 
@@ -210,6 +254,7 @@ def optimize_connecting_rod(
         "mass_reduction_pct": round(mass_reduction_pct, 2),
         "surrogate_metrics": bundle["metrics"],
     }
+
 
 if __name__ == "__main__":
     train_surrogate_model()

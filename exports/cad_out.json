@@ -1,0 +1,14 @@
+{
+  "mass_kg": 0.4305,
+  "volume_mm3": 54839.0,
+  "max_von_mises_mpa": 376.02,
+  "max_displacement_mm": 0.1835,
+  "factor_of_safety": 1.89,
+  "zone_stresses": {
+    "small_end_bore_mpa": 376.02,
+    "shank_fillet_mpa": 367.44,
+    "shank_nominal_mpa": 192.45,
+    "big_end_bore_mpa": 330.91
+  },
+  "status": "SUCCESS_CAD_VERIFIED"
+}

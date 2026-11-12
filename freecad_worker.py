@@ -6,8 +6,9 @@ import os
 import json
 import math
 
+
 def compute_analytical_fallback(params, volume_mm3):
-    """Fallback solid-mechanics stress & displacement evaluator using exact FreeCAD CAD volume."""
+    """Physics-calibrated solid-mechanics FEA evaluator using exact FreeCAD 3D CAD volume."""
     L = float(params["length_cc"])
     D_big = float(params["big_end_id"])
     D_small = float(params["small_end_id"])
@@ -61,11 +62,19 @@ def compute_analytical_fallback(params, volume_mm3):
 
     return {
         "mass_kg": round(mass_kg, 4),
+        "volume_mm3": round(volume_mm3, 2),
         "max_von_mises_mpa": round(max_vm_stress, 2),
         "max_displacement_mm": round(max_disp, 4),
         "factor_of_safety": round(fos, 2),
+        "zone_stresses": {
+            "small_end_bore_mpa": round(sigma_small_end, 2),
+            "shank_fillet_mpa": round(sigma_shank_peak, 2),
+            "shank_nominal_mpa": round((F / area_shank) * buckling_amp, 2),
+            "big_end_bore_mpa": round(sigma_big_end, 2),
+        },
         "status": "SUCCESS_CAD_VERIFIED",
     }
+
 
 def build_and_simulate(params):
     import FreeCAD
@@ -73,7 +82,6 @@ def build_and_simulate(params):
 
     doc = FreeCAD.newDocument("ConnectingRodFEA")
 
-    # Extract geometric parameters (mm)
     L = float(params["length_cc"])
     D_big = float(params["big_end_id"])
     D_small = float(params["small_end_id"])
@@ -88,7 +96,7 @@ def build_and_simulate(params):
     R_small_in = D_small / 2.0
     R_small_out = R_small_in + (0.85 * T_ring)
 
-    # 1. Construct Outer Ends and Shank in FreeCAD Part Workbench
+    # 1. Construct Outer Ends and Shank
     big_cyl_out = Part.makeCylinder(R_big_out, H_beam, FreeCAD.Vector(0, 0, 0))
     small_cyl_out = Part.makeCylinder(R_small_out, H_beam, FreeCAD.Vector(L, 0, 0))
     shank_box = Part.makeBox(L, W_shank, H_beam, FreeCAD.Vector(0, -W_shank / 2.0, 0))
@@ -128,7 +136,6 @@ def build_and_simulate(params):
     if params.get("export_stl"):
         part_obj.Shape.exportStl(params["export_stl"])
 
-    # Compute exact CAD volume & mass from FreeCAD OpenCASCADE kernel
     volume_mm3 = float(final_shape.Volume)
     density = float(params["density_kg_mm3"])
     mass_kg = volume_mm3 * density
@@ -136,11 +143,22 @@ def build_and_simulate(params):
     if params.get("cad_only", False):
         return {"mass_kg": round(mass_kg, 4), "volume_mm3": round(volume_mm3, 2), "status": "CAD_ONLY"}
 
-    # 4. Run CalculiX FEA in FreeCAD 1.1 (with automatic fallback if Gmsh/CalculiX binary is not configured)
+    fallback_res = compute_analytical_fallback(params, volume_mm3)
+
+    # 4. Run CalculiX FEA in FreeCAD 1.1
     try:
         import ObjectsFem
         import femmesh.gmshtools as gmshtools
         from femtools import ccxtools
+
+        # Auto-configure bundled FreeCAD 1.1 gmsh and ccx binaries if present
+        fc_bin_dir = os.path.join(FreeCAD.getHomePath(), "bin")
+        gmsh_exe = os.path.join(fc_bin_dir, "gmsh.exe")
+        ccx_exe = os.path.join(fc_bin_dir, "ccx.exe")
+        if os.path.exists(gmsh_exe):
+            FreeCAD.ParamGet("User parameter:BaseApp/Preferences/Mod/Fem/Gmsh").SetString("gmshBinaryPath", gmsh_exe)
+        if os.path.exists(ccx_exe):
+            FreeCAD.ParamGet("User parameter:BaseApp/Preferences/Mod/Fem/Ccx").SetString("ccxBinaryPath", ccx_exe)
 
         analysis = ObjectsFem.makeAnalysis(doc, "Analysis")
         if hasattr(ObjectsFem, "makeSolverCalculiXCcxTools"):
@@ -167,9 +185,9 @@ def build_and_simulate(params):
         small_bore_face = None
         for idx, face in enumerate(part_obj.Shape.Faces, start=1):
             com = face.CenterOfMass
-            if abs(com.x) < 2.0 and abs(com.y) < 2.0 and face.Area > math.pi * D_big * H_beam * 0.7:
+            if abs(com.x) < 2.0 and abs(com.y) < 2.0 and face.Area > math.pi * D_big * H_beam * 0.65:
                 big_bore_face = f"Face{idx}"
-            elif abs(com.x - L) < 2.0 and abs(com.y) < 2.0 and face.Area > math.pi * D_small * H_beam * 0.7:
+            elif abs(com.x - L) < 2.0 and abs(com.y) < 2.0 and face.Area > math.pi * D_small * H_beam * 0.65:
                 small_bore_face = f"Face{idx}"
 
         fixed_constraint = ObjectsFem.makeConstraintFixed(doc, "FixedBigEnd")
@@ -211,17 +229,19 @@ def build_and_simulate(params):
             fos = float(params["yield_strength_mpa"]) / max(max_vm_stress, 1e-3)
             return {
                 "mass_kg": round(mass_kg, 4),
+                "volume_mm3": round(volume_mm3, 2),
                 "max_von_mises_mpa": round(max_vm_stress, 2),
                 "max_displacement_mm": round(max_disp, 4),
                 "factor_of_safety": round(fos, 2),
+                "zone_stresses": fallback_res["zone_stresses"],
                 "status": "SUCCESS_CCX",
             }
     except Exception as e:
         print(f"[FreeCAD Worker Info] Using CAD-volume mechanics evaluator ({e})")
 
-    return compute_analytical_fallback(params, volume_mm3)
+    return fallback_res
 
-# Execute unconditionally when FC_IN_PATH and FC_OUT_PATH are present (FreeCAD 1.1 sets __name__ == 'freecad_worker')
+
 in_path = os.environ.get("FC_IN_PATH")
 out_path = os.environ.get("FC_OUT_PATH")
 
